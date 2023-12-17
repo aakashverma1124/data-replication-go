@@ -8,7 +8,7 @@ import (
 )
 
 func CheckReplicaAvailability(replicaDB *sql.DB) {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for {

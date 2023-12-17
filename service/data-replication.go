@@ -21,29 +21,79 @@ func InitDataReplicationService(masterDB *sql.DB, replicaDB *sql.DB) *DataReplic
 }
 
 func (dataReplicationService *DataReplication) CreateEmployee(c *gin.Context) {
+	// Begin a transaction on the master database
+	txMaster, err := dataReplicationService.MasterDB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() {
+		// Rollback the transaction if there is an error
+		if err := recover(); err != nil {
+			txMaster.Rollback()
+		}
+	}()
+
+	// Begin a transaction on the replica database
+	txReplica, err := dataReplicationService.ReplicaDB.Begin()
+	if err != nil {
+		txMaster.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() {
+		// Rollback the transactions if there is an error
+		if err := recover(); err != nil {
+			txMaster.Rollback()
+			txReplica.Rollback()
+		}
+	}()
+
 	var employee model.Employee
 	if err := c.BindJSON(&employee); err != nil {
+		txMaster.Rollback()
+		txReplica.Rollback()
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Write to master database
-	result, err := dataReplicationService.MasterDB.Exec("INSERT INTO emp (id, name, salary) VALUES ($1, $2, $3) RETURNING id", employee.ID, employee.Name, employee.Salary)
+	// Write to master database within the transaction
+	resultMaster, err := txMaster.Exec("INSERT INTO emp (id, name, salary) VALUES ($1, $2, $3) RETURNING id", employee.ID, employee.Name, employee.Salary)
 	if err != nil {
+		txMaster.Rollback()
+		txReplica.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Retrieve the last inserted ID
-	_, err = result.RowsAffected()
+	// Retrieve the last inserted ID from master
+	_, err = resultMaster.RowsAffected()
 	if err != nil {
+		txMaster.Rollback()
+		txReplica.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Sync data to replica database
-	if _, err := dataReplicationService.ReplicaDB.Exec("INSERT INTO emp (id, name, salary) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET name = $2, salary = $3", employee.ID, employee.Name, employee.Salary); err != nil {
+	// Write to replica database within the transaction
+	if _, err := txReplica.Exec("INSERT INTO emp (id, name, salary) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET name = $2, salary = $3", employee.ID, employee.Name, employee.Salary); err != nil {
+		txMaster.Rollback()
+		txReplica.Rollback()
 		log.Println("Failed to sync data to replica:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Commit the transactions only if both succeed
+	if err := txMaster.Commit(); err != nil {
+		txReplica.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := txReplica.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
 	// Return the inserted ID in the response
